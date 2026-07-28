@@ -13,9 +13,16 @@ app.use(cors());
 app.use(express.json({ limit: '5mb' }));
 
 // ===== File uploads (program .exe files) =====
-// NOTE: attach a Railway volume mounted at this path, or uploaded files
-// will be lost on every redeploy — same as the SQLite db file.
-const UPLOAD_DIR = path.join(__dirname, 'uploads');
+// If a Railway Volume is attached, Railway sets RAILWAY_VOLUME_MOUNT_PATH automatically —
+// we store uploads + the DB there so they survive redeploys/restarts.
+// WITHOUT A VOLUME ATTACHED IN RAILWAY, THIS FALLS BACK TO EPHEMERAL STORAGE AND
+// EVERY UPLOADED FILE (AND THE DB) IS WIPED ON THE NEXT DEPLOY. Attach one in
+// Railway → Service → Settings → Volumes, mount path can be anything (e.g. /data).
+const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || __dirname;
+if (!process.env.RAILWAY_VOLUME_MOUNT_PATH) {
+  console.warn('⚠️  No Railway Volume detected (RAILWAY_VOLUME_MOUNT_PATH not set). Uploaded files and the database will be lost on the next deploy/restart until you attach one.');
+}
+const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 app.use('/uploads', express.static(UPLOAD_DIR));
 
@@ -38,8 +45,8 @@ const {
   PORT = 3000
 } = process.env;
 
-// ===== DB (attach a Railway volume so this persists across deploys) =====
-const db = new Database('data.db');
+// ===== DB (lives on the same volume-aware path as uploads) =====
+const db = new Database(path.join(DATA_DIR, 'data.db'));
 db.exec(`
   CREATE TABLE IF NOT EXISTS programs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,6 +65,13 @@ db.exec(`
     avatar TEXT,
     first_seen TEXT DEFAULT CURRENT_TIMESTAMP,
     last_seen TEXT DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS banners (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    image_url TEXT NOT NULL,
+    link_url TEXT,
+    sort_order INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
   );
 `);
 
@@ -169,6 +183,25 @@ app.post('/programs/:id/download', requireAuth, (req, res) => {
   const row = db.prepare('SELECT download_url, download_count FROM programs WHERE id=?').get(req.params.id);
   if (!row) return res.status(404).json({ error: 'not found' });
   res.json(row);
+});
+
+// ===== Home banners (animated carousel) =====
+app.get('/banners', requireAuth, (req, res) => {
+  const rows = db.prepare('SELECT * FROM banners ORDER BY sort_order ASC, created_at ASC').all();
+  res.json(rows);
+});
+
+app.post('/banners', requireAuth, requireOwner, (req, res) => {
+  const { image_url, link_url, sort_order } = req.body;
+  if (!image_url) return res.status(400).json({ error: 'image_url required' });
+  const info = db.prepare('INSERT INTO banners (image_url, link_url, sort_order) VALUES (?,?,?)')
+    .run(image_url, link_url || '', sort_order || 0);
+  res.json({ id: info.lastInsertRowid });
+});
+
+app.delete('/banners/:id', requireAuth, requireOwner, (req, res) => {
+  db.prepare('DELETE FROM banners WHERE id=?').run(req.params.id);
+  res.json({ ok: true });
 });
 
 // ===== Dashboard stats (owner only) =====
