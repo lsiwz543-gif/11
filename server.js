@@ -8,21 +8,12 @@ const path = require('path');
 const fs = require('fs');
 
 const app = express();
-app.set('trust proxy', 1); // Railway sits behind a proxy; without this req.protocol reports 'http'
 app.use(cors());
 app.use(express.json({ limit: '5mb' }));
 
-// ===== File uploads (program .exe files) =====
-// If a Railway Volume is attached, Railway sets RAILWAY_VOLUME_MOUNT_PATH automatically —
-// we store uploads + the DB there so they survive redeploys/restarts.
-// WITHOUT A VOLUME ATTACHED IN RAILWAY, THIS FALLS BACK TO EPHEMERAL STORAGE AND
-// EVERY UPLOADED FILE (AND THE DB) IS WIPED ON THE NEXT DEPLOY. Attach one in
-// Railway → Service → Settings → Volumes, mount path can be anything (e.g. /data).
-const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || __dirname;
-if (!process.env.RAILWAY_VOLUME_MOUNT_PATH) {
-  console.warn('⚠️  No Railway Volume detected (RAILWAY_VOLUME_MOUNT_PATH not set). Uploaded files and the database will be lost on the next deploy/restart until you attach one.');
-}
-const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
+
+// will be lost on every redeploy — same as the SQLite db file.
+const UPLOAD_DIR = path.join(__dirname, 'uploads');
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 app.use('/uploads', express.static(UPLOAD_DIR));
 
@@ -45,8 +36,8 @@ const {
   PORT = 3000
 } = process.env;
 
-// ===== DB (lives on the same volume-aware path as uploads) =====
-const db = new Database(path.join(DATA_DIR, 'data.db'));
+// ===== DB (attach a Railway volume so this persists across deploys) =====
+const db = new Database('data.db');
 db.exec(`
   CREATE TABLE IF NOT EXISTS programs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,11 +57,23 @@ db.exec(`
     first_seen TEXT DEFAULT CURRENT_TIMESTAMP,
     last_seen TEXT DEFAULT CURRENT_TIMESTAMP
   );
-  CREATE TABLE IF NOT EXISTS banners (
+  CREATE TABLE IF NOT EXISTS support_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    image_url TEXT NOT NULL,
-    link_url TEXT,
-    sort_order INTEGER DEFAULT 0,
+    user_discord_id TEXT NOT NULL,
+    username TEXT,
+    avatar TEXT,
+    status TEXT DEFAULT 'open',
+    claimed_by TEXT,
+    owner_seen_at TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS support_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL,
+    sender TEXT NOT NULL,
+    sender_name TEXT,
+    message TEXT NOT NULL,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
   );
 `);
@@ -130,9 +133,10 @@ app.get('/auth/callback', async (req, res) => {
 // ===== Auth middleware =====
 function requireAuth(req, res, next) {
   const auth = req.headers.authorization;
-  if (!auth) return res.status(401).json({ error: 'No token' });
+  const raw = auth ? auth.replace('Bearer ', '') : req.query.token;
+  if (!raw) return res.status(401).json({ error: 'No token' });
   try {
-    req.user = jwt.verify(auth.replace('Bearer ', ''), JWT_SECRET);
+    req.user = jwt.verify(raw, JWT_SECRET);
     next();
   } catch {
     res.status(401).json({ error: 'Invalid token' });
@@ -185,26 +189,144 @@ app.post('/programs/:id/download', requireAuth, (req, res) => {
   res.json(row);
 });
 
-// ===== Home banners (animated carousel) =====
-app.get('/banners', requireAuth, (req, res) => {
-  const rows = db.prepare('SELECT * FROM banners ORDER BY sort_order ASC, created_at ASC').all();
+// ===== Support chat: live SSE streams =====
+// sessionSubscribers: sessionId -> Set<res>   (the one user in that chat, watching their own thread)
+// ownerSubscribers: Set<res>                  (the owner-only dashboard, watching every thread at once)
+const sessionSubscribers = new Map();
+const ownerSubscribers = new Set();
+
+function sseHeaders(res) {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+  res.write('\n');
+}
+function sseSend(res, event, data) {
+  res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+function broadcastToSession(sessionId, event, data) {
+  const set = sessionSubscribers.get(Number(sessionId));
+  if (set) for (const r of set) sseSend(r, event, data);
+}
+function broadcastToOwners(event, data) {
+  for (const r of ownerSubscribers) sseSend(r, event, data);
+}
+// Keeps SSE connections alive through proxies (Railway included) that would
+// otherwise time out an idle HTTP connection after ~30-60s of silence.
+setInterval(() => {
+  for (const set of sessionSubscribers.values()) for (const r of set) r.write(': ping\n\n');
+  for (const r of ownerSubscribers) r.write(': ping\n\n');
+}, 25000);
+
+// ===== User side: start/resume a support session =====
+app.post('/support/session', requireAuth, (req, res) => {
+  let session = db.prepare(`
+    SELECT * FROM support_sessions WHERE user_discord_id=? AND status != 'closed' ORDER BY created_at DESC LIMIT 1
+  `).get(req.user.id);
+
+  let isNew = false;
+  if (!session) {
+    const info = db.prepare(`INSERT INTO support_sessions (user_discord_id, username, avatar) VALUES (?,?,?)`)
+      .run(req.user.id, req.user.username, req.user.avatar);
+    session = db.prepare('SELECT * FROM support_sessions WHERE id=?').get(info.lastInsertRowid);
+    isNew = true;
+
+    // Automatic first reply so the person isn't staring at an empty chat —
+    // fires once, right when the session is created.
+    const autoMsg = db.prepare(`
+      INSERT INTO support_messages (session_id, sender, sender_name, message) VALUES (?, 'owner', 'Support', ?)
+    `).run(session.id, "Thanks for reaching out — the team will respond to you shortly.");
+    session = db.prepare('SELECT * FROM support_sessions WHERE id=?').get(session.id);
+    broadcastToOwners('new-session', session);
+  }
+
+  const messages = db.prepare('SELECT * FROM support_messages WHERE session_id=? ORDER BY created_at ASC').all(session.id);
+  res.json({ session, messages, isNew });
+});
+
+// ===== Send a message — works for the session's own user, or the owner replying =====
+app.post('/support/message', requireAuth, (req, res) => {
+  const { sessionId, message } = req.body;
+  if (!sessionId || !message || !message.trim()) return res.status(400).json({ error: 'sessionId and message required' });
+
+  const session = db.prepare('SELECT * FROM support_sessions WHERE id=?').get(sessionId);
+  if (!session) return res.status(404).json({ error: 'session not found' });
+
+  const isOwner = !!req.user.isOwner;
+  const isSessionUser = String(session.user_discord_id) === String(req.user.id);
+  if (!isOwner && !isSessionUser) return res.status(403).json({ error: 'not your session' });
+
+  const sender = isOwner ? 'owner' : 'user';
+  const senderName = isOwner ? (req.user.username || 'North') : (req.user.username || session.username);
+  const info = db.prepare(`INSERT INTO support_messages (session_id, sender, sender_name, message) VALUES (?,?,?,?)`)
+    .run(sessionId, sender, senderName, message.trim());
+  db.prepare(`UPDATE support_sessions SET updated_at=CURRENT_TIMESTAMP WHERE id=?`).run(sessionId);
+
+  const fullMessage = db.prepare('SELECT * FROM support_messages WHERE id=?').get(info.lastInsertRowid);
+  broadcastToSession(sessionId, 'message', fullMessage);
+  broadcastToOwners('message', { ...fullMessage, session_user: session.username, session_avatar: session.avatar });
+  res.json(fullMessage);
+});
+
+// ===== Live stream for a single chat thread (the user's own side) =====
+app.get('/support/stream/:sessionId', requireAuth, (req, res) => {
+  const sessionId = Number(req.params.sessionId);
+  const session = db.prepare('SELECT * FROM support_sessions WHERE id=?').get(sessionId);
+  if (!session) return res.status(404).end();
+  const isOwner = !!req.user.isOwner;
+  const isSessionUser = String(session.user_discord_id) === String(req.user.id);
+  if (!isOwner && !isSessionUser) return res.status(403).end();
+
+  sseHeaders(res);
+  if (!sessionSubscribers.has(sessionId)) sessionSubscribers.set(sessionId, new Set());
+  sessionSubscribers.get(sessionId).add(res);
+  req.on('close', () => { sessionSubscribers.get(sessionId)?.delete(res); });
+});
+
+// ===== Owner dashboard: inbox, claim, live global stream =====
+app.get('/support/owner/sessions', requireAuth, requireOwner, (req, res) => {
+  const rows = db.prepare(`
+    SELECT s.*,
+      (SELECT message FROM support_messages m WHERE m.session_id = s.id ORDER BY m.created_at DESC LIMIT 1) as last_message,
+      (SELECT COUNT(*) FROM support_messages m WHERE m.session_id = s.id AND m.sender='user' AND m.created_at > COALESCE(s.owner_seen_at, '1970-01-01')) as unread
+    FROM support_sessions s
+    ORDER BY s.updated_at DESC
+  `).all();
   res.json(rows);
 });
 
-app.post('/banners', requireAuth, requireOwner, (req, res) => {
-  const { image_url, link_url, sort_order } = req.body;
-  if (!image_url) return res.status(400).json({ error: 'image_url required' });
-  const info = db.prepare('INSERT INTO banners (image_url, link_url, sort_order) VALUES (?,?,?)')
-    .run(image_url, link_url || '', sort_order || 0);
-  res.json({ id: info.lastInsertRowid });
+app.get('/support/owner/sessions/:id/messages', requireAuth, requireOwner, (req, res) => {
+  const messages = db.prepare('SELECT * FROM support_messages WHERE session_id=? ORDER BY created_at ASC').all(req.params.id);
+  db.prepare('UPDATE support_sessions SET owner_seen_at=CURRENT_TIMESTAMP WHERE id=?').run(req.params.id);
+  res.json(messages);
 });
 
-app.delete('/banners/:id', requireAuth, requireOwner, (req, res) => {
-  db.prepare('DELETE FROM banners WHERE id=?').run(req.params.id);
-  res.json({ ok: true });
+app.post('/support/owner/sessions/:id/claim', requireAuth, requireOwner, (req, res) => {
+  db.prepare(`UPDATE support_sessions SET status='claimed', claimed_by=? WHERE id=?`).run(req.user.username || 'North', req.params.id);
+  const session = db.prepare('SELECT * FROM support_sessions WHERE id=?').get(req.params.id);
+  broadcastToSession(req.params.id, 'claimed', session);
+  broadcastToOwners('claimed', session);
+  res.json(session);
 });
 
-// ===== Dashboard stats (owner only) =====
+app.post('/support/owner/sessions/:id/close', requireAuth, requireOwner, (req, res) => {
+  db.prepare(`UPDATE support_sessions SET status='closed' WHERE id=?`).run(req.params.id);
+  const session = db.prepare('SELECT * FROM support_sessions WHERE id=?').get(req.params.id);
+  broadcastToSession(req.params.id, 'closed', session);
+  broadcastToOwners('closed', session);
+  res.json(session);
+});
+
+app.get('/support/owner/stream', requireAuth, requireOwner, (req, res) => {
+  sseHeaders(res);
+  ownerSubscribers.add(res);
+  req.on('close', () => ownerSubscribers.delete(res));
+});
+
+
 app.get('/dashboard/stats', requireAuth, requireOwner, (req, res) => {
   const totalDownloads = db.prepare('SELECT COALESCE(SUM(download_count),0) as n FROM programs').get().n;
   const totalUsers = db.prepare('SELECT COUNT(*) as n FROM users').get().n;
